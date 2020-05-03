@@ -5,16 +5,10 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <errno.h>
 
 #include "socks.h"
 
-struct socks_negotiate_req {
-    __u_char __ver;
-    __u_char __nmethods;
-    __u_char * __methods; 
-};
-
-typedef struct socks_negotiate_req socks_nreq_t;
 #define SOCKS_NREQ_SZ (sizeof(socks_nreq_t))
 
 struct socks_negotiate_res {
@@ -62,6 +56,34 @@ struct socks_res {
 
 typedef struct socks_res socks_res_t;
 
+static char errbuff[256];
+
+char * 
+socks_strerror(int err) 
+{
+    int wr = 0;
+    char * ret;
+
+    switch(err) {
+    case SOCKS_ELEN:
+        wr += sprintf(errbuff, "Invalid length of the buffer");
+        ret = errbuff;
+        break;
+    case SOCKS_EVER:
+        wr += sprintf(errbuff, "Invalid version of protocol");
+        ret = errbuff;
+        break;
+    case SOCKS_EREJ:
+        wr += sprintf(errbuff, "Remote rejected method");
+        ret = errbuff;
+        break;
+    default:
+        ret = strerror(err);
+    }
+
+    return ret;
+}
+
 SOCKADDR_IN 
 socks_default_sockaddr_in()
 {
@@ -74,8 +96,13 @@ socks_default_sockaddr_in()
     return res;
 }
 
-int 
-read_all(int sfd, void * buff, size_t * buffl) 
+/*
+    read up to buffl bytes from socket. 
+    if FIN arrives then set buffl to number of bytes read n <= buffl
+    and return
+*/
+int
+read_all(int sfd, void * buff, size_t * buffl)
 {
     ssize_t nor = 0, totr = 0;
 
@@ -85,24 +112,51 @@ read_all(int sfd, void * buff, size_t * buffl)
         }
 
         if(nor == 0) {
-            *buffl = totr;
-            return 0;
-        }
-
-        if((size_t)nor == (*buffl-totr)) {
+            if(totr == 0) {
+                /* if we didnt read anything. then its probably connection reset */
+                errno = ECONNRESET;
+                return -1;
+            }
             break;
         }
 
         totr += nor;
+
+        if((size_t)totr == *buffl) {
+            break;
+        }
     } 
 
+    *buffl = totr;
+
     return 0; 
+}
+
+/*
+    read exactly buffl bytes from socket
+    if received lesser than buffl then return -1 and ser errno to SOCKS_ELEN
+*/
+int
+read_size(int sfd, void * buff, size_t buffl) 
+{
+    size_t actual_len = buffl;
+
+    if(read_all(sfd, buff, &actual_len) != 0) {
+        return -1;
+    }
+
+    if(actual_len != buffl) {
+        errno = SOCKS_ELEN;
+        return -1;
+    }
+
+    return 0;
 }
 
 int 
 write_all(int sfd, void * buff, size_t buffl) 
 {
-    ssize_t nowr = 0, totwr, wrrem;
+    ssize_t nowr = 0, totwr = 0, wrrem;
 
     while(1) {
         wrrem = buffl-totwr;
@@ -115,7 +169,11 @@ write_all(int sfd, void * buff, size_t buffl)
         }
 
         totwr += nowr;
-    } 
+    }
+
+    if(shutdown(sfd, SHUT_WR) != 0) {
+        return -1;
+    }
 
     return 0;
 }
@@ -123,41 +181,52 @@ write_all(int sfd, void * buff, size_t buffl)
 int 
 socks_negotiate(int sfd, __u_char ver, __u_char nmethods, __u_char * methods)
 {
-    socks_nreq_t req;
+    /* only ver 5 is supported for now */
+    if(ver != SOCKS_V_5) {
+        errno = SOCKS_EVER;
+        return -1;
+    }
+
+    char * req;
     socks_nres_t res;
-    size_t ressz = SOCKS_NRES_SZ;
+    size_t ressz = SOCKS_NRES_SZ, i;
 
-    req.__ver = ver;
-    req.__nmethods = nmethods;
-    req.__methods = methods;
-
-    if(write_all(sfd, &req, SOCKS_NREQ_SZ) != 0) {
+    if((req = malloc(2 + nmethods)) == NULL) {
         return -1;
     }
 
-    if(read_all(sfd, &res, &ressz)) {
-        return -1;
+    req[0] = ver;
+    req[1] = nmethods;
+    for(i = 0; i < nmethods; i++) {
+        req[i+2] = methods[i];
     }
 
-    if(ressz != SOCKS_NRES_SZ) {
-        printf("invalid size read\n");
-        return -1;
+    if(write_all(sfd, req, 2+nmethods) != 0) {
+        goto fin;
     }
 
-    if(res.__ver != req.__ver) {
-        printf("invalid res [ ver ]: %u\n", res.__ver);
-        return -1;
+    if(read_size(sfd, &res, ressz)) {
+        goto fin;
+    }
+
+    if(res.__ver != req[0]) {
+        errno = SOCKS_EVER;
+        goto fin;
     }
 
     if(res.__method == SOCKS_M_UNACCEPT) {
-        printf("remote rejected method\n");
-        return -1;
+        errno = SOCKS_EREJ;
+        goto fin;
     }
 
-    return 0;
+fin:
+    if(req != NULL) {
+        free(req);
+    }
+    return errno == 0 ? 0 : -1;
 }
 
-int 
+void 
 socks_close(int sfd) 
 {
     if(sfd > 0) {
@@ -168,12 +237,18 @@ socks_close(int sfd)
 socks_res_t *
 __get_socks_response(void * resbuf, size_t resbufl)
 {
-
+    (void)resbuf;
+    (void)resbufl;
+    return NULL;
 }
 
 void
 __free_socks_response(socks_res_t * res)
 {
+    if(res == NULL) {
+        return;
+    }
+
     if(res->__addr != NULL) {
         free(res->__addr);
     }
@@ -183,7 +258,7 @@ int
 socks_request_in(int sfd, __u_char ver, __u_char cmd, SOCKADDR_IN addr)
 {
     struct socks_in req;
-    socks_res_t * res;
+    socks_res_t * sres;
     char res[MAX_RES_SIZE];
     size_t ressz = MAX_RES_SIZE;
 
@@ -202,12 +277,12 @@ socks_request_in(int sfd, __u_char ver, __u_char cmd, SOCKADDR_IN addr)
         return -1;
     }
 
-    if((res = __get_socks_response(res, ressz)) == NULL) {
+    if((sres = __get_socks_response(res, ressz)) == NULL) {
         return -1;
     }
     
     // either return response or process it?
-    __free_socks_response(res);
+    __free_socks_response(sres);
 
     return 0;
 }
@@ -216,7 +291,7 @@ int
 socks_request_in6(int sfd, __u_char ver, __u_char cmd, SOCKADDR_IN6 addr)
 {
     struct socks_in6 req;
-    socks_res_t * res;
+    socks_res_t * sres;
     char res[MAX_RES_SIZE];
     size_t ressz = MAX_RES_SIZE;
 
@@ -235,12 +310,12 @@ socks_request_in6(int sfd, __u_char ver, __u_char cmd, SOCKADDR_IN6 addr)
         return -1;
     }
 
-    if((res = __get_socks_response(res, ressz)) == NULL) {
+    if((sres = __get_socks_response(res, ressz)) == NULL) {
         return -1;
     }
     
     // either return response or process it?
-    __free_socks_response(res);
+    __free_socks_response(sres);
 
     return 0;
 }
@@ -251,6 +326,11 @@ socks_request_in6(int sfd, __u_char ver, __u_char cmd, SOCKADDR_IN6 addr)
 int
 socks_request_domain_s(int sfd, __u_char ver, __u_char cmd, char * domain_str)
 {
+    (void)sfd;
+    (void)ver;
+    (void)cmd;
+    (void)domain_str;
     /* implement */
+    return 0;
 }
 

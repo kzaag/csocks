@@ -5,6 +5,15 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 
+/* csocks error codes */
+
+#define SOCKS_ELEN 987001 /* Invalid buffer length */
+#define SOCKS_EVER 987002 /* Invalid version of protocol */
+#define SOCKS_EREJ 987003 /* Remote rejected method */
+
+/* ------------------ */
+
+
 #define SOCKS_V_4 4
 #define SOCKS_V_5 5
 
@@ -42,7 +51,7 @@ SOCKADDR_IN socks_default_sockaddr_in();
 /*
     close socket
 */
-int socks_close(int sfd);
+void socks_close(int sfd);
 
 #define socks_connect(sfd, saddr) \
     connect(sfd, (const struct sockaddr *)&(saddr), sizeof(saddr))
@@ -50,9 +59,15 @@ int socks_close(int sfd);
 /*
     socks negotiate without any authentication
 */
-#define socks_negotiate_0(sfd, ver) socks_negotiate((sfd), (ver), 1, &(__u_char){1})
+#define socks_negotiate_0(sfd, ver) socks_negotiate((sfd), (ver), 1, &(__u_char){SOCKS_M_0})
 
 /*------END CONVENIENCE METHODS-----*/
+
+/*
+    is not thread safe.
+    since its basically wrapper around strerror
+*/
+char * socks_strerror(int err);
 
 int socks_negotiate(int sfd, __u_char ver, __u_char nmethods, __u_char * methods);
 

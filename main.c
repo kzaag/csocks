@@ -34,7 +34,7 @@ ok:
 
 fail:
     socks_close(sfd);
-    printf("Err: %s\n", strerror(errno));
+    printf("Err: %s\n", socks_strerror(errno));
     return 1;
 
 }
