@@ -9,54 +9,100 @@
 
 #include "socks.h"
 
-#define SOCKS_NREQ_SZ (sizeof(socks_nreq_t))
-
-struct socks_negotiate_res {
-    __u_char __ver;
-    __u_char __method;
-};
-
-typedef struct socks_negotiate_res socks_nres_t;
-#define SOCKS_NRES_SZ (sizeof(socks_nres_t))
-
-struct socks_hdr {
+struct socks_res {
     __u_char __ver;
     /* CMD or REP */
-    __u_char __code;
+    __u_char __rep;
     __u_char __rsv;
     __u_char __atyp;
-};
-
-typedef struct socks_hdr socks_hdr_t;
-
-struct socks_in {
-    socks_hdr_t __hdr;
-    in_addr_t __addr;
+    __u_char * __addr;
     in_port_t __port;
 };
 
-struct socks_in6 {
-    socks_hdr_t __hdr;
-    struct in6_addr __addr;
-    in_port_t __port;
-};
+__u_char
+socks_res_get_reply(struct socks_res * res)
+{
+    return res->__rep;
+}
 
-struct socks_res {
-    socks_hdr_t __hdr;
-    void * __addr;
-    in_port_t __port;
-};
+__u_char
+socks_res_get_addr_type(struct socks_res * res)
+{
+    return res->__atyp;
+}
+
+int
+socks_res_get_addr_in(struct socks_res * res, socks_addr_in * outbuf)
+{
+    if(res->__atyp != SOCKS_ATYP_IP_V4) {
+        errno = SOCKS_EADR;
+        return -1;
+    }
+
+    outbuf->sin_port = res->__port;
+    memcpy(&outbuf->sin_addr, res->__addr , 4);
+    return 0;
+}
 
 /*
     256 because biggest response ( domain ) 
     contains one octed specifing size + domain itself.
     that gives 1 + 255
 */
-#define MAX_RES_SIZE (sizeof(socks_hdr_t) + 256 + 2)
+#define MAX_RES_SIZE (4 + 256 + 2)
 
-typedef struct socks_res socks_res_t;
+static char outbuff[256];
 
-static char errbuff[256];
+char *
+socks_strrep(__u_char code)
+{
+    char * ret;
+
+    switch(code){
+    case SOCKS_REP_SUCCESS:
+        sprintf(outbuff, "Succeeded");
+        ret = outbuff;
+        break;
+    case SOCKS_REP_FAILURE:
+        sprintf(outbuff, "General SOCKS server failure");
+        ret = outbuff;
+        break;
+    case SOCKS_REP_CONN_NOT_ALLOWED:
+        sprintf(outbuff, "Connection not allowed by ruleset");
+        ret = outbuff;
+        break;
+    case SOCKS_REP_NET_UNREACHABLE:
+        sprintf(outbuff, "Network unreachable");
+        ret = outbuff;
+        break;
+    case SOCKS_REP_HOST_UNREACHABLE:
+        sprintf(outbuff, "Host unreachable");
+        ret = outbuff;
+        break;
+    case SOCKS_REP_CONN_REFUSED:
+        sprintf(outbuff, "Connection refused");
+        ret = outbuff;
+        break;
+    case SOCKS_REP_TTL_EXPIRED:
+        sprintf(outbuff, "TTL expired");
+        ret = outbuff;
+        break;
+    case SOCKS_REP_CMD_NOT_SUPPORTED:
+        sprintf(outbuff, "Command not supported");
+        ret = outbuff;
+        break;
+    case SOCKS_REP_ADDR_NOT_SUPPORTED:
+        sprintf(outbuff, "Address type not supported");
+        ret = outbuff;
+        break;
+    default:
+        sprintf(outbuff, "Uknown");
+        ret = outbuff;
+        break;
+    }
+
+    return ret;
+}
 
 char * 
 socks_strerror(int err) 
@@ -66,16 +112,20 @@ socks_strerror(int err)
 
     switch(err) {
     case SOCKS_ELEN:
-        wr += sprintf(errbuff, "Invalid length of the buffer");
-        ret = errbuff;
+        wr += sprintf(outbuff, "Invalid length of the buffer");
+        ret = outbuff;
         break;
     case SOCKS_EVER:
-        wr += sprintf(errbuff, "Invalid version of protocol");
-        ret = errbuff;
+        wr += sprintf(outbuff, "Invalid version of protocol");
+        ret = outbuff;
         break;
     case SOCKS_EREJ:
-        wr += sprintf(errbuff, "Remote rejected method");
-        ret = errbuff;
+        wr += sprintf(outbuff, "Remote rejected method");
+        ret = outbuff;
+        break;
+    case SOCKS_EADR:
+        wr += sprintf(outbuff, "Invalid address type");
+        ret = outbuff;
         break;
     default:
         ret = strerror(err);
@@ -84,7 +134,32 @@ socks_strerror(int err)
     return ret;
 }
 
-SOCKADDR_IN 
+socks_addr_in
+socks_addr(char * ip, in_port_t port)
+{
+    struct sockaddr_in res;
+
+    res.sin_family = AF_INET;
+    res.sin_port = htons(port);
+    res.sin_addr.s_addr = inet_addr(ip);
+
+    return res;
+}
+
+int
+socks_sockaddr_in6(char * ip, in_port_t port, socks_addr_in6 * outbuf)
+{
+    if (inet_pton(AF_INET6, ip, &outbuf->sin6_addr) != 1) {
+        return -1;
+    } 
+
+    outbuf->sin6_port = port;
+    outbuf->sin6_family = AF_INET6;
+
+    return 0;
+}
+
+socks_addr_in 
 socks_default_sockaddr_in()
 {
     struct sockaddr_in res;
@@ -96,130 +171,45 @@ socks_default_sockaddr_in()
     return res;
 }
 
-/*
-    read up to buffl bytes from socket. 
-    if FIN arrives then set buffl to number of bytes read n <= buffl
-    and return
-*/
-int
-read_all(int sfd, void * buff, size_t * buffl)
-{
-    ssize_t nor = 0, totr = 0;
-
-    while(1) {
-        if((nor = read(sfd, buff+totr, *buffl-totr)) < 0) {
-            return -1;
-        }
-
-        if(nor == 0) {
-            if(totr == 0) {
-                /* if we didnt read anything. then its probably connection reset */
-                errno = ECONNRESET;
-                return -1;
-            }
-            break;
-        }
-
-        totr += nor;
-
-        if((size_t)totr == *buffl) {
-            break;
-        }
-    } 
-
-    *buffl = totr;
-
-    return 0; 
-}
-
-/*
-    read exactly buffl bytes from socket
-    if received lesser than buffl then return -1 and ser errno to SOCKS_ELEN
-*/
-int
-read_size(int sfd, void * buff, size_t buffl) 
-{
-    size_t actual_len = buffl;
-
-    if(read_all(sfd, buff, &actual_len) != 0) {
-        return -1;
-    }
-
-    if(actual_len != buffl) {
-        errno = SOCKS_ELEN;
-        return -1;
-    }
-
-    return 0;
-}
-
 int 
-write_all(int sfd, void * buff, size_t buffl) 
+socks5_negotiate(int sfd, __u_char nmethods, __u_char * methods)
 {
-    ssize_t nowr = 0, totwr = 0, wrrem;
-
-    while(1) {
-        wrrem = buffl-totwr;
-        if((nowr = write(sfd+totwr, buff, wrrem)) < 0) {
-            return -1;
-        }
-
-        if(nowr == wrrem) {
-            break;
-        }
-
-        totwr += nowr;
-    }
-
-    if(shutdown(sfd, SHUT_WR) != 0) {
-        return -1;
-    }
-
-    return 0;
-}
-
-int 
-socks_negotiate(int sfd, __u_char ver, __u_char nmethods, __u_char * methods)
-{
-    /* only ver 5 is supported for now */
-    if(ver != SOCKS_V_5) {
-        errno = SOCKS_EVER;
-        return -1;
-    }
-
-    char * req;
-    socks_nres_t res;
-    size_t ressz = SOCKS_NRES_SZ, i;
+    __u_char * req;
+    __u_char res[2];
+    size_t i;
 
     if((req = malloc(2 + nmethods)) == NULL) {
         return -1;
     }
 
-    req[0] = ver;
+    req[0] = SOCKS_V_5;
     req[1] = nmethods;
     for(i = 0; i < nmethods; i++) {
         req[i+2] = methods[i];
     }
 
-    if(write_all(sfd, req, 2+nmethods) != 0) {
+    if(write(sfd, req, 2+nmethods) != 2+nmethods) {
+        if(errno == 0)
+            errno = SOCKS_ELEN;
         goto fin;
     }
 
-    if(read_size(sfd, &res, ressz)) {
+    if(read(sfd, res, 2) != 2) {
+        errno = SOCKS_ELEN;
         goto fin;
     }
 
-    if(res.__ver != req[0]) {
+    if(res[0] != req[0]) {
         errno = SOCKS_EVER;
         goto fin;
     }
 
-    if(res.__method == SOCKS_M_UNACCEPT) {
+    if(res[1] == SOCKS_M_UNACCEPT) {
         errno = SOCKS_EREJ;
         goto fin;
     }
 
-fin:
+    fin:
     if(req != NULL) {
         free(req);
     }
@@ -235,15 +225,64 @@ socks_close(int sfd)
 }
 
 socks_res_t *
-__get_socks_response(void * resbuf, size_t resbufl)
+__get_socks_response(__u_char * resbuf, size_t resbufl)
 {
-    (void)resbuf;
-    (void)resbufl;
-    return NULL;
+    if(resbufl < 10) {
+        errno = SOCKS_ELEN;
+        return NULL;
+    }
+
+    __u_char * addr;
+    socks_res_t * res;
+
+    if((res = malloc(sizeof(socks_res_t))) == NULL){
+        return NULL;
+    }
+
+    res->__ver = resbuf[0];
+    res->__rep = resbuf[1];
+    res->__rsv = resbuf[2];
+    res->__atyp = resbuf[3];
+
+    __u_char asize, offset = 0;
+
+    switch(res->__atyp) {
+    case SOCKS_ATYP_IP_V4:
+        asize = 4;
+        break;
+    case SOCKS_ATYP_IP_V6:
+        asize = 16;
+        break;
+    case SOCKS_ATYP_DOMAINNAME:
+        offset = 1;
+        asize = resbuf[4];
+        break;
+    default:
+        errno = SOCKS_EVER;
+        free(res);
+        return NULL;
+    }
+
+    if(resbufl < (size_t)(4+offset+asize+2)) {
+        free(res);
+        errno = SOCKS_ELEN;
+        return NULL;
+    }
+
+    if((addr = malloc(asize)) == NULL) {
+        free(res);
+        return NULL;
+    }
+
+    memcpy(addr, resbuf+4+offset, asize);
+    res->__addr = addr;
+    memcpy(&res->__port, resbuf+4+offset+asize, 2);
+
+    return res;
 }
 
 void
-__free_socks_response(socks_res_t * res)
+socks_response_free(socks_res_t * res)
 {
     if(res == NULL) {
         return;
@@ -252,85 +291,82 @@ __free_socks_response(socks_res_t * res)
     if(res->__addr != NULL) {
         free(res->__addr);
     }
+
+    free(res);
 }
 
-int 
-socks_request_in(int sfd, __u_char ver, __u_char cmd, SOCKADDR_IN addr)
+socks_res_t *
+socks5_request(int sfd, __u_char cmd, void * addr, size_t addrl, in_port_t port)
 {
-    struct socks_in req;
+    __u_char req[6+addrl];
+    __u_char res[MAX_RES_SIZE];
     socks_res_t * sres;
-    char res[MAX_RES_SIZE];
-    size_t ressz = MAX_RES_SIZE;
+    ssize_t rd;
 
-    req.__hdr.__ver = ver;
-    req.__hdr.__rsv = 0;
-    req.__hdr.__code = cmd;
-    req.__hdr.__atyp = SOCKS_ATYP_IP_V4;
-    req.__addr = addr.sin_addr.s_addr;
-    req.__port = addr.sin_port;
+    req[0] = SOCKS_V_5;
+    req[1] = cmd;
+    req[2] = 0;
+    switch(addrl) {
+    case 4:
+        req[3] = SOCKS_ATYP_IP_V4;
+        break;
+    case 16:
+        req[3] = SOCKS_ATYP_IP_V6;
+        break;
+    default:
+        req[3] = SOCKS_ATYP_DOMAINNAME;
+        break;
+    }
+    memcpy(req+4, addr, addrl);
+    memcpy(req+4+addrl, &port, 2);
 
-    if(write_all(sfd, &req, sizeof(struct socks_in)) != 0) {
-        return -1;
+    if((size_t)write(sfd, req, 6+addrl)!=(6+addrl)) {
+        if(errno == 0)
+            errno = SOCKS_ELEN;
+        return NULL;
     }
 
-    if(read_all(sfd, res, &ressz) != 0) {
-        return -1;
-    }
-
-    if((sres = __get_socks_response(res, ressz)) == NULL) {
-        return -1;
+    if((rd = read(sfd, res, MAX_RES_SIZE)) < 0) {
+        return NULL;
     }
     
-    // either return response or process it?
-    __free_socks_response(sres);
-
-    return 0;
-}
-
-int
-socks_request_in6(int sfd, __u_char ver, __u_char cmd, SOCKADDR_IN6 addr)
-{
-    struct socks_in6 req;
-    socks_res_t * sres;
-    char res[MAX_RES_SIZE];
-    size_t ressz = MAX_RES_SIZE;
-
-    req.__hdr.__ver = ver;
-    req.__hdr.__rsv = 0;
-    req.__hdr.__code = cmd;
-    req.__hdr.__atyp = SOCKS_ATYP_IP_V6;
-    memcpy(&req.__addr, &addr.sin6_addr, 16);
-    req.__port = addr.sin6_port;
-
-    if(write_all(sfd, &req, sizeof(struct socks_in6)) != 0) {
-        return -1;
+    if((sres = __get_socks_response(res, rd)) == NULL) {
+        return NULL;
     }
 
-    if(read_all(sfd, res, &ressz) != 0) {
-        return -1;
+    if(sres->__ver != SOCKS_V_5) {
+        errno = SOCKS_EVER;
+        return NULL;
     }
 
-    if((sres = __get_socks_response(res, ressz)) == NULL) {
-        return -1;
-    }
-    
-    // either return response or process it?
-    __free_socks_response(sres);
-
-    return 0;
+    return sres;
 }
 
 /*
-    domain_str must be null terminated string
+    domainstr is domain no more than 255 characters null terminated.
+    port is host order destination port number
 */
-int
-socks_request_domain_s(int sfd, __u_char ver, __u_char cmd, char * domain_str)
+socks_res_t *
+socks5_request_domain(int sfd, __u_char cmd, char * domainstr, in_port_t port)
 {
-    (void)sfd;
-    (void)ver;
-    (void)cmd;
-    (void)domain_str;
-    /* implement */
-    return 0;
+    socks_res_t * res;
+    __u_char addrl;
+
+    if(strlen(domainstr) > 255) {
+        errno = EOVERFLOW;
+        return NULL;
+    }
+
+    addrl = (__u_char)strlen(domainstr);
+
+    char addr[addrl+1];
+
+    addr[0] = addrl;
+    memcpy(addr+1, domainstr, addrl);
+
+    res = socks5_request(sfd, cmd, addr, addrl+1, htons(port));
+
+    return res;
 }
+
 
